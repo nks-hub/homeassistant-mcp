@@ -222,7 +222,7 @@ interface CommandParams {
   repeat?: 'off' | 'all' | 'one';
 }
 
-const commonCommands = ['turn_on', 'turn_off', 'toggle'] as const;
+const commonCommands = ['turn_on', 'turn_off', 'toggle', 'press', 'set_value'] as const;
 const coverCommands = [...commonCommands, 'open', 'close', 'stop', 'set_position', 'set_tilt_position'] as const;
 const climateCommands = [...commonCommands, 'set_temperature', 'set_hvac_mode', 'set_fan_mode', 'set_humidity'] as const;
 const mediaPlayerCommands = [...commonCommands, 'media_play', 'media_pause', 'media_play_pause', 'media_stop', 'media_next_track', 'media_previous_track', 'volume_up', 'volume_down', 'volume_set', 'volume_mute', 'select_source', 'shuffle_set', 'repeat_set'] as const;
@@ -526,7 +526,15 @@ async function main() {
 
           case 'switch':
           case 'contact':
-            // These domains only support basic operations (turn_on, turn_off, toggle)
+          case 'input_boolean':
+          case 'automation':
+          case 'script':
+          case 'button':
+          case 'scene':
+          case 'input_select':
+          case 'number':
+          case 'select':
+            // These domains only support basic operations (turn_on, turn_off, toggle, press, set_value etc.)
             break;
 
           case 'media_player':

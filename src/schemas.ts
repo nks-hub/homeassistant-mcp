@@ -14,7 +14,16 @@ export const DomainSchema = z.enum([
     "vacuum",
     "scene",
     "script",
-    "camera"
+    "camera",
+    "input_boolean",
+    "input_select",
+    "input_number",
+    "number",
+    "select",
+    "button",
+    "automation",
+    "timer",
+    "counter"
 ]);
 
 // Generic list request schema
