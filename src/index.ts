@@ -584,22 +584,170 @@ async function main() {
   server.addTool(controlTool);
   tools.push(controlTool);
 
+  // Helper: get fresh Spotify access token using refresh token stored in HA config entries
+  async function getSpotifyAccessToken(): Promise<{ accessToken: string; deviceMap: Record<string, string> } | null> {
+    try {
+      // Read config entries file to get Spotify OAuth token
+      const fs = await import('fs/promises');
+      const configPath = process.env.HASS_CONFIG_PATH || '/homeassistant/.storage/core.config_entries';
+      const raw = await fs.readFile(configPath, 'utf-8');
+      const configEntries = JSON.parse(raw);
+      const spotifyEntry = (configEntries?.data?.entries || []).find(
+        (e: Record<string, unknown>) => e.domain === 'spotify'
+      );
+      if (!spotifyEntry) return null;
+
+      const tokenData = (spotifyEntry.data as Record<string, unknown>)?.token as Record<string, unknown>;
+      const refreshToken = tokenData?.refresh_token as string;
+      const clientId = (spotifyEntry.data as Record<string, unknown>)?.auth_implementation as string;
+
+      // Get client credentials from application_credentials storage
+      const credsPath = process.env.HASS_APP_CREDS_PATH || '/homeassistant/.storage/application_credentials';
+      const credsRaw = await fs.readFile(credsPath, 'utf-8');
+      const credsData = JSON.parse(credsRaw);
+      const cred = (credsData?.data?.items || []).find(
+        (c: Record<string, unknown>) => c.domain === 'spotify'
+      );
+      if (!cred) return null;
+
+      // Refresh the access token
+      const params = new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: cred.client_id as string,
+        client_secret: cred.client_secret as string,
+      });
+      const tokenResp = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      if (!tokenResp.ok) return null;
+      const tokenJson = await tokenResp.json() as Record<string, string>;
+      const accessToken = tokenJson.access_token;
+      if (!accessToken) return null;
+
+      // Get device list and build name→id map
+      const devResp = await fetch('https://api.spotify.com/v1/me/player/devices', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const devJson = await devResp.json() as { devices: Array<{ id: string; name: string }> };
+      const deviceMap: Record<string, string> = {};
+      for (const dev of devJson.devices || []) {
+        deviceMap[dev.name] = dev.id;
+      }
+
+      return { accessToken, deviceMap };
+    } catch {
+      return null;
+    }
+  }
+
   // Add the media player play_media tool
   const playMediaTool = {
     name: 'play_media',
-    description: 'Play media on a Home Assistant media player entity (Spotify playlists, tracks, albums, radio stations, etc.)',
+    description: 'Play media on a Home Assistant media player entity (Spotify playlists, tracks, albums, radio stations, etc.). For Spotify entities, automatically uses Spotify Web API for reliable playback on Spotify Connect devices.',
     parameters: z.object({
       entity_id: z.string().describe('The media player entity ID (e.g. "media_player.spotify_lukas_rysanek")'),
-      media_content_id: z.string().describe('The content ID to play (e.g. "spotify:playlist:37i9dQZF1DXb57XGYoiiby" or a URL)'),
+      media_content_id: z.string().describe('The content ID to play (e.g. "spotify:playlist:37i9dQZF1DXb57XGYoiiby" or "spotify:track:..." or a URL)'),
       media_content_type: z.enum(['music', 'tvshow', 'video', 'episode', 'channel', 'playlist', 'image', 'url', 'game', 'app']).optional()
         .describe('Type of media content (default: "playlist")'),
       source: z.string().optional()
         .describe('Optionally select a source/device before playing (e.g. "Pioneer VSX-832 ED822D")'),
       shuffle: z.boolean().optional()
         .describe('Enable shuffle mode before playing'),
+      search_query: z.string().optional()
+        .describe('Search query to find a Spotify playlist by name (alternative to media_content_id)'),
     }),
-    execute: async (params: { entity_id: string; media_content_id: string; media_content_type?: string; source?: string; shuffle?: boolean }) => {
+    execute: async (params: { entity_id: string; media_content_id: string; media_content_type?: string; source?: string; shuffle?: boolean; search_query?: string }) => {
       try {
+        const isSpotify = params.entity_id.includes('spotify') || params.media_content_id.startsWith('spotify:');
+
+        // --- Spotify Web API path ---
+        if (isSpotify) {
+          const spotifyCtx = await getSpotifyAccessToken();
+          if (spotifyCtx) {
+            const { accessToken, deviceMap } = spotifyCtx;
+
+            // Resolve device ID from source name or pick first active
+            let deviceId: string | undefined;
+            if (params.source) {
+              deviceId = deviceMap[params.source] ?? Object.values(deviceMap)[0];
+            } else {
+              deviceId = Object.values(deviceMap)[0];
+            }
+
+            // Resolve media_content_id if it's a search query
+            let contentId = params.media_content_id;
+            if (params.search_query) {
+              const searchResp = await fetch(
+                `https://api.spotify.com/v1/search?q=${encodeURIComponent(params.search_query)}&type=playlist&limit=1&market=CZ`,
+                { headers: { Authorization: `Bearer ${accessToken}` } }
+              );
+              const searchJson = await searchResp.json() as { playlists?: { items?: Array<{ uri: string; name: string }> } };
+              const found = searchJson.playlists?.items?.[0];
+              if (found) {
+                contentId = found.uri;
+              }
+            }
+
+            // Enable shuffle if requested
+            if (params.shuffle !== undefined && deviceId) {
+              await fetch(
+                `https://api.spotify.com/v1/me/player/shuffle?state=${params.shuffle}&device_id=${deviceId}`,
+                { method: 'PUT', headers: { Authorization: `Bearer ${accessToken}` } }
+              );
+            }
+
+            // Build play body based on content type
+            type PlayBody = { context_uri?: string; uris?: string[]; offset?: { position: number }; position_ms: number };
+            const playBody: PlayBody = { position_ms: 0 };
+            if (contentId.startsWith('spotify:track:') || contentId.startsWith('spotify:episode:')) {
+              playBody.uris = [contentId];
+            } else {
+              playBody.context_uri = contentId;
+              playBody.offset = { position: 0 };
+            }
+
+            const playUrl = deviceId
+              ? `https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`
+              : 'https://api.spotify.com/v1/me/player/play';
+
+            const playResp = await fetch(playUrl, {
+              method: 'PUT',
+              headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify(playBody),
+            });
+
+            if (!playResp.ok && playResp.status !== 204) {
+              const errText = await playResp.text();
+              throw new Error(`Spotify API error ${playResp.status}: ${errText}`);
+            }
+
+            // Wait and report current state
+            await new Promise(r => setTimeout(r, 2000));
+            const stateResp = await fetch('https://api.spotify.com/v1/me/player', {
+              headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            const stateJson = await stateResp.json() as Record<string, unknown>;
+            const item = (stateJson.item as Record<string, unknown>) || {};
+            const artists = ((item.artists as Array<{ name: string }>) || []).map(a => a.name).join(', ');
+
+            return {
+              success: true,
+              message: `Playing on ${(stateJson.device as Record<string, string>)?.name ?? 'Spotify device'}`,
+              is_playing: stateJson.is_playing,
+              track: (item.name as string) || null,
+              artist: artists || null,
+              context: contentId,
+              device: (stateJson.device as Record<string, string>)?.name ?? null,
+              shuffle: stateJson.shuffle_state,
+            };
+          }
+          // Fall through to HA path if Spotify API unavailable
+        }
+
+        // --- Home Assistant path (fallback / non-Spotify) ---
         // Optionally select source first
         if (params.source) {
           await fetch(`${HASS_HOST}/api/services/media_player/select_source`, {
@@ -610,7 +758,6 @@ async function main() {
             },
             body: JSON.stringify({ entity_id: params.entity_id, source: params.source }),
           });
-          // Small delay to allow source switch
           await new Promise(resolve => setTimeout(resolve, 500));
         }
 
