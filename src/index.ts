@@ -214,11 +214,18 @@ interface CommandParams {
   hvac_mode?: string;
   fan_mode?: string;
   humidity?: number;
+  // Media player parameters
+  volume_level?: number;
+  is_volume_muted?: boolean;
+  source?: string;
+  shuffle?: boolean;
+  repeat?: 'off' | 'all' | 'one';
 }
 
 const commonCommands = ['turn_on', 'turn_off', 'toggle'] as const;
 const coverCommands = [...commonCommands, 'open', 'close', 'stop', 'set_position', 'set_tilt_position'] as const;
 const climateCommands = [...commonCommands, 'set_temperature', 'set_hvac_mode', 'set_fan_mode', 'set_humidity'] as const;
+const mediaPlayerCommands = [...commonCommands, 'media_play', 'media_pause', 'media_play_pause', 'media_stop', 'media_next_track', 'media_previous_track', 'volume_up', 'volume_down', 'volume_set', 'volume_mute', 'select_source', 'shuffle_set', 'repeat_set'] as const;
 
 interface HassEntity {
   entity_id: string;
@@ -416,7 +423,7 @@ async function main() {
     name: 'control',
     description: 'Control Home Assistant devices and services',
     parameters: z.object({
-      command: z.enum([...commonCommands, ...coverCommands, ...climateCommands])
+      command: z.enum([...commonCommands, ...coverCommands, ...climateCommands, ...mediaPlayerCommands])
         .describe('The command to execute'),
       entity_id: z.string().describe('The entity ID to control'),
       // Common parameters
@@ -445,7 +452,18 @@ async function main() {
       fan_mode: z.enum(['auto', 'low', 'medium', 'high']).optional()
         .describe('Fan mode for climate devices'),
       humidity: z.number().min(0).max(100).optional()
-        .describe('Target humidity for climate devices')
+        .describe('Target humidity for climate devices'),
+      // Media player parameters
+      volume_level: z.number().min(0).max(1).optional()
+        .describe('Volume level for media players (0.0-1.0)'),
+      is_volume_muted: z.boolean().optional()
+        .describe('Whether to mute/unmute the media player'),
+      source: z.string().optional()
+        .describe('Source/input to select on the media player (e.g. "BLUETOOTH", "Pioneer VSX-832 ED822D")'),
+      shuffle: z.boolean().optional()
+        .describe('Enable/disable shuffle mode for media players'),
+      repeat: z.enum(['off', 'all', 'one']).optional()
+        .describe('Repeat mode for media players (off, all, one)')
     }),
     execute: async (params: CommandParams) => {
       try {
@@ -511,6 +529,24 @@ async function main() {
             // These domains only support basic operations (turn_on, turn_off, toggle)
             break;
 
+          case 'media_player':
+            if (service === 'volume_set' && params.volume_level !== undefined) {
+              serviceData.volume_level = params.volume_level;
+            }
+            if (service === 'volume_mute' && params.is_volume_muted !== undefined) {
+              serviceData.is_volume_muted = params.is_volume_muted;
+            }
+            if (service === 'select_source' && params.source !== undefined) {
+              serviceData.source = params.source;
+            }
+            if (service === 'shuffle_set' && params.shuffle !== undefined) {
+              serviceData.shuffle = params.shuffle;
+            }
+            if (service === 'repeat_set' && params.repeat !== undefined) {
+              serviceData.repeat = params.repeat;
+            }
+            break;
+
           default:
             throw new Error(`Unsupported operation for domain: ${domain}`);
         }
@@ -547,6 +583,88 @@ async function main() {
   };
   server.addTool(controlTool);
   tools.push(controlTool);
+
+  // Add the media player play_media tool
+  const playMediaTool = {
+    name: 'play_media',
+    description: 'Play media on a Home Assistant media player entity (Spotify playlists, tracks, albums, radio stations, etc.)',
+    parameters: z.object({
+      entity_id: z.string().describe('The media player entity ID (e.g. "media_player.spotify_lukas_rysanek")'),
+      media_content_id: z.string().describe('The content ID to play (e.g. "spotify:playlist:37i9dQZF1DXb57XGYoiiby" or a URL)'),
+      media_content_type: z.enum(['music', 'tvshow', 'video', 'episode', 'channel', 'playlist', 'image', 'url', 'game', 'app']).optional()
+        .describe('Type of media content (default: "playlist")'),
+      source: z.string().optional()
+        .describe('Optionally select a source/device before playing (e.g. "Pioneer VSX-832 ED822D")'),
+      shuffle: z.boolean().optional()
+        .describe('Enable shuffle mode before playing'),
+    }),
+    execute: async (params: { entity_id: string; media_content_id: string; media_content_type?: string; source?: string; shuffle?: boolean }) => {
+      try {
+        // Optionally select source first
+        if (params.source) {
+          await fetch(`${HASS_HOST}/api/services/media_player/select_source`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${HASS_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ entity_id: params.entity_id, source: params.source }),
+          });
+          // Small delay to allow source switch
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        // Optionally enable shuffle
+        if (params.shuffle !== undefined) {
+          await fetch(`${HASS_HOST}/api/services/media_player/shuffle_set`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${HASS_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ entity_id: params.entity_id, shuffle: params.shuffle }),
+          });
+        }
+
+        // Play the media
+        const response = await fetch(`${HASS_HOST}/api/services/media_player/play_media`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${HASS_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            entity_id: params.entity_id,
+            media_content_type: params.media_content_type ?? 'playlist',
+            media_content_id: params.media_content_id,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Failed to play media: ${response.statusText}`);
+        }
+
+        const data = await response.json() as Array<{ entity_id: string; state: string; attributes: Record<string, any> }>;
+        const state = Array.isArray(data) && data.length > 0 ? data[0] : null;
+
+        return {
+          success: true,
+          message: `Playing media on ${params.entity_id}`,
+          state: state?.state,
+          media_title: state?.attributes?.media_title,
+          media_artist: state?.attributes?.media_artist,
+          source: state?.attributes?.source,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          message: error instanceof Error ? error.message : 'Unknown error occurred'
+        };
+      }
+    }
+  };
+  server.addTool(playMediaTool);
+  tools.push(playMediaTool);
 
   // Add the history tool
   const historyTool = {
